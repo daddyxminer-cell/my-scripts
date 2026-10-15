@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Ubuntu Server/Desktop 24.04 LTS, Intel/AMD 64-bit. Run as a normal user.
+# Ubuntu Server/Desktop 24.04 LTS, Intel/AMD 64-bit. No elevation required.
+# Runs as the current account; never installs system packages or switches users.
 # Official v0.10.3 public testnet, pinned and hash-checked (2026-10-15).
 # Usage: bash hegemon-ubuntu.sh [--mine] [--threads 4] [--install-only]
 # Never run with bash -x: wallet passwords must not be traced.
@@ -7,10 +8,6 @@ set +x
 set -euo pipefail
 umask 077
 ulimit -c 0
-if (( EUID == 0 )); then
-  echo 'Run as your normal desktop user, NOT with sudo. Only apt uses sudo.' >&2
-  exit 1
-fi
 if [[ "$(uname -s):$(uname -m)" != Linux:x86_64 ]]; then
   echo 'This official release supports Linux x86_64 (Intel/AMD), not Linux ARM.' >&2
   exit 1
@@ -21,9 +18,10 @@ for argument in "$@"; do
     --help|-h)
       cat <<'HELP'
 Usage: bash hegemon-ubuntu.sh [OPTIONS]
-Ubuntu Server/Desktop 24.04 x86_64: automatically install prerequisites,
-create Desktop/hegemon/data, verify Hegemon v0.10.3, and launch in tmux.
-No Downloads folder or graphical desktop is needed.
+Ubuntu Server/Desktop 24.04 x86_64: user-local, no-elevation installer.
+Creates Desktop/hegemon/data, verifies Hegemon v0.10.3, and uses tmux if present.
+No Downloads folder, graphical desktop, login shell or user switching needed.
+Requires Python 3.11+ and working system TLS certificates; tmux is optional.
 
   --directory PATH   Installation folder (default: your Desktop/hegemon)
   --mine             Offer mining after sync, NTP and checkpoint checks
@@ -33,30 +31,24 @@ No Downloads folder or graphical desktop is needed.
   --install-only     Install/verify only; do not start tmux, node or wallet
   --no-tmux          Run in this terminal instead (stops on SSH disconnect)
 
-Only package installation uses sudo. Wallet passwords are never saved.
-Detach: Ctrl+B, then D. Re-run this script to reconnect to its tmux session.
-An existing tmux terminal is reused. This does not install a reboot service.
+Never calls sudo, su, apt or chown; never changes system users or permissions.
+Uses the running account's registered home, not an incorrectly inherited HOME.
+Already root? It warns and continues AS ROOT; it does not drop privileges.
+Wallet passwords are never saved. Missing dependencies are reported, not installed.
+With tmux: Ctrl+B then D to detach; re-run to reconnect. Without tmux: keep SSH open.
+An existing tmux terminal is reused. No automatic reboot startup is installed.
 HELP
       exit 0
       ;;
   esac
 done
-missing=()
-for package in python3 ca-certificates libgcc-s1 curl tmux; do
-  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -qx 'install ok installed'; then
-    missing+=("$package")
-  fi
-done
-if (( ${#missing[@]} )); then
-  if ! command -v sudo >/dev/null 2>&1; then
-    echo 'sudo is required to install missing packages. Ask your administrator to install:' >&2
-    printf '  %s\n' "${missing[*]}" >&2
-    exit 1
-  fi
-  echo "Installing required Ubuntu packages: ${missing[*]}"
-  sudo apt-get update
-  sudo apt-get install -y "${missing[@]}"
+if ! command -v python3 >/dev/null 2>&1; then
+  echo 'Python 3.11+ is required (Ubuntu 24.04 normally includes 3.12).' >&2
+  echo 'Use an image with Python or ask your provider to supply it. No system changes were made.' >&2
+  exit 1
 fi
+# Do not pass inherited shell startup hooks to tmux or its child Bash.
+unset BASH_ENV ENV
 script_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
 exec python3 - "$script_path" "$@" <<'HEGEMON_PYTHON'
 import argparse
@@ -66,6 +58,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import pwd
 import re
 import select
 import shlex
@@ -94,6 +87,30 @@ HASHES = {
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def configure_account():
+    """Resolve the effective account independently of HOME/SUDO_USER/LOGNAME."""
+    try:
+        account = pwd.getpwuid(os.geteuid())
+    except KeyError as error:
+        raise RuntimeError("Current UID has no account entry; ask the provider to configure its home.") from error
+    home = Path(account.pw_dir)
+    if not home.is_absolute() or str(home) in ("/", "/nonexistent"):
+        raise RuntimeError("Current account has no usable registered home directory.")
+    if os.environ.get("HOME") != str(home):
+        print(f"Correcting inherited HOME for account {account.pw_name}: {home}")
+        # XDG locations inherited from a different account can redirect writes too.
+        for key in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_RUNTIME_DIR"):
+            os.environ.pop(key, None)
+    os.environ.update(HOME=str(home), USER=account.pw_name, LOGNAME=account.pw_name, SHELL="/bin/bash")
+    for key in ("BASH_ENV", "ENV", "SUDO_USER", "SUDO_UID", "SUDO_GID"):
+        os.environ.pop(key, None)
+    print(f"Running as {account.pw_name} (UID {os.geteuid()}); no privilege elevation or user switching.")
+    if os.geteuid() == 0:
+        print("WARNING: launched as root, so node/wallet will also run as root.\n"
+              "A normal account is recommended; this script does not drop privileges.", file=sys.stderr)
+    return home
 
 
 def desktop_directory():
@@ -135,7 +152,7 @@ def launch_tmux(source, options, root):
     """Keep the interactive wallet alive across SSH disconnects; never persist secrets."""
     tmux = shutil.which("tmux")
     if not tmux:
-        raise RuntimeError("tmux was not installed successfully; rerun the Bash installer.")
+        raise RuntimeError("tmux is unavailable. Run with --no-tmux to use the current terminal.")
     # A private socket per installation avoids attaching to an unrelated session.
     # The normal user owns this directory (0700); no system service is installed.
     socket_path = str(root / ".tmux.sock")
@@ -159,7 +176,7 @@ def launch_tmux(source, options, root):
         if exists.returncode != 0:
             # shlex.join prevents shell interpretation of paths/options. The child
             # flag prevents recursion; each Popen has its own interpreter input.
-            child = shlex.join(["bash", str(source.resolve()), "--no-tmux", *options,
+            child = shlex.join(["/bin/bash", "--noprofile", "--norc", str(source.resolve()), "--no-tmux", *options,
                                 "--directory", str(root)])
             # Keep startup errors visible rather than instantly closing the pane.
             child += ('; result=$?; if [ "$result" -ne 0 ]; then '
@@ -416,7 +433,8 @@ class Session:
             ntp = None
         if ntp is None or ntp.returncode != 0 or ntp.stdout.strip() != "yes":
             print("Mining stays OFF: system time is not confirmed synchronized.\n"
-                  "On Ubuntu run: sudo timedatectl set-ntp true\nWait for synchronization, then try 'm' again.")
+                  "Ask your provider to enable/verify host time synchronization.\n"
+                  "Containers may not expose timedatectl. This script will not change the host clock.")
             return
         print("Get a recent block HEIGHT and HASH from a trusted, synced public-testnet operator.\n"
               "Do NOT copy your own node's hash as the independent checkpoint.")
@@ -491,22 +509,33 @@ def interrupted(_signal, _frame):
 
 
 def main(argv):
+    if sys.version_info < (3, 11):
+        raise RuntimeError("Python 3.11+ is required; no system packages will be installed.")
+    configure_account()
     source = Path(argv[0])
     args = arguments(argv[1:])
     os.umask(0o077)
-    if os.geteuid() == 0:
-        raise RuntimeError("Do not run this launcher as root.")
     distro = __import__("platform").freedesktop_os_release()
     if distro.get("ID") != "ubuntu" or distro.get("VERSION_ID") != "24.04":
         print("Warning: intended for Ubuntu 24.04 LTS x86_64; your distribution differs.")
     root = args.directory.expanduser().resolve()
-    root.mkdir(parents=True, exist_ok=True)
-    root.chmod(0o700)
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        if root.stat().st_uid != os.geteuid():
+            raise RuntimeError(f"{root} belongs to another account. Use its owner or choose an empty --directory you own.\n"
+                               "Existing wallet data will not be moved, replaced, or have ownership changed.")
+        root.chmod(0o700)
+    except PermissionError as error:
+        raise RuntimeError(f"Cannot access {root} as this account. Choose a writable --directory you own.\n"
+                           "No system permission or ownership changes will be attempted.") from error
     # Start/reattach before taking the process lock. The child acquires the lock
     # and installs binaries; reconnecting must not contend with its live lock.
     if not args.install_only and not args.no_tmux and not os.environ.get("TMUX"):
-        launch_tmux(source, argv[1:], root)
-        return
+        if shutil.which("tmux"):
+            launch_tmux(source, argv[1:], root)
+            return
+        print("tmux is not installed. Continuing in this terminal without installing packages.\n"
+              "Keep SSH open: disconnecting will stop the node/wallet. Re-run to resume saved data.")
     # Lock belongs to the launcher, not the children. Crashes do not leave stale PID ownership.
     with (root / ".launcher.lock").open("a") as lock:
         try:
